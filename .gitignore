@@ -48,3 +48,6 @@ coverage
 
 # Vercel
 .vercel
+
+# Claude Code
+.claude
