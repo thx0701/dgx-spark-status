@@ -1,43 +1,149 @@
-# Svelte + Vite
+# DGX Spark Status
 
-This template should help get you started developing with Svelte in Vite.
+Real-time system monitoring dashboard for DGX systems with comprehensive GPU, CPU, memory metrics and Ollama LLM model management.
 
-## Recommended IDE Setup
+## Features
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode).
+### System Monitoring
+- **CPU Metrics** - Real-time CPU usage with per-core monitoring, brand info, and thread count
+- **Memory Tracking** - Total, used, free, and active memory with percentage gauges
+- **GPU Monitoring** - NVIDIA GPU utilization, memory, temperature, and power draw via nvidia-smi
+- **Disk Usage** - Multi-partition disk monitoring with usage percentages
+- **Network I/O** - Real-time network throughput (upload/download speeds)
+- **Process Monitoring** - Top memory-consuming processes with CPU usage
+- **System Uptime** - Days, hours, and minutes since boot
 
-## Need an official Svelte framework?
+### Ollama Integration
+- **Model Management** - View all installed Ollama models with size and parameter info
+- **Load/Unload** - Dynamic model loading and unloading from memory
+- **Download Models** - Pull new models directly from the dashboard
+- **Delete Models** - Remove unwanted models with confirmation
+- **Running Status** - Visual indication of currently loaded models
+- **Activity Console** - Real-time logging of model operations
 
-Check out [SvelteKit](https://github.com/sveltejs/kit#readme), which is also powered by Vite. Deploy anywhere with its serverless-first approach and adapt to various platforms, with out of the box support for TypeScript, SCSS, and Less, and easily-added support for mdsvex, GraphQL, PostCSS, Tailwind CSS, and more.
+### UI Features
+- **Circular Gauges** - Clean visualization with yellow (70%) and red (90%) threshold indicators
+- **Live Updates** - Server-Sent Events (SSE) for real-time metrics streaming (1s interval)
+- **Responsive Grid** - Auto-fitting card layout that adapts to screen size
+- **Dark Theme** - Professional dark interface optimized for 24/7 monitoring
+- **Modal Interface** - Dedicated model management dialog with console output
 
-## Technical considerations
+## Prerequisites
 
-**Why use this over SvelteKit?**
+- **Node.js** v25.6.0+ (via nvm recommended)
+- **NVIDIA GPU** with nvidia-smi installed
+- **Ollama** (optional) - For LLM model management features
+- **Linux** - Tested on Ubuntu 24.04
 
-- It brings its own routing solution which might not be preferable for some users.
-- It is first and foremost a framework that just happens to use Vite under the hood, not a Vite app.
+## Installation
 
-This template contains as little as possible to get started with Vite + Svelte, while taking into account the developer experience with regards to HMR and intellisense. It demonstrates capabilities on par with the other `create-vite` templates and is a good starting point for beginners dipping their toes into a Vite + Svelte project.
+```bash
+# Clone the repository
+git clone https://github.com/Viroscope/dgx-spark-status.git
+cd dgx-spark-status
 
-Should you later need the extended capabilities and extensibility provided by SvelteKit, the template has been structured similarly to SvelteKit so that it is easy to migrate.
+# Install dependencies
+npm install
 
-**Why include `.vscode/extensions.json`?**
-
-Other templates indirectly recommend extensions via the README, but this file allows VS Code to prompt the user to install the recommended extension upon opening the project.
-
-**Why enable `checkJs` in the JS template?**
-
-It is likely that most cases of changing variable types in runtime are likely to be accidental, rather than deliberate. This provides advanced typechecking out of the box. Should you like to take advantage of the dynamically-typed nature of JavaScript, it is trivial to change the configuration.
-
-**Why is HMR not preserving my local component state?**
-
-HMR state preservation comes with a number of gotchas! It has been disabled by default in both `svelte-hmr` and `@sveltejs/vite-plugin-svelte` due to its often surprising behavior. You can read the details [here](https://github.com/sveltejs/svelte-hmr/tree/master/packages/svelte-hmr#preservation-of-local-state).
-
-If you have state that's important to retain within a component, consider creating an external store which would not be replaced by HMR.
-
-```js
-// store.js
-// An extremely simple external store
-import { writable } from 'svelte/store'
-export default writable(0)
+# Start development server
+npm run dev
 ```
+
+## Usage
+
+### Development Server
+```bash
+npm run dev
+```
+Dashboard will be available at `http://localhost:9000`
+
+The dev server includes:
+- SSE endpoint at `/api/metrics`
+- Ollama management API at `/api/ollama`
+- Hot module reloading via Vite
+
+### Production Build
+```bash
+npm run build
+node server.js
+```
+
+### Start Script
+```bash
+./start.sh
+```
+Convenient wrapper that handles Node version switching via nvm.
+
+## Configuration
+
+### Update Interval
+Modify `UPDATE_INTERVAL` in `dev-server.js` or `src/routes/api/metrics/+server.js`:
+```javascript
+const UPDATE_INTERVAL = 1000; // milliseconds
+```
+
+### Ollama API Endpoint
+Change `OLLAMA_API` if running Ollama on different host/port:
+```javascript
+const OLLAMA_API = 'http://localhost:11434';
+```
+
+### Port Configuration
+Development server runs on port 9000 by default. Change in `dev-server.js`:
+```javascript
+server: {
+  host: '0.0.0.0',
+  port: 9000
+}
+```
+
+## Technology Stack
+
+- **SvelteKit 2.50.2** - Full-stack framework with SSR
+- **Svelte 5.43.8** - Reactive UI framework with modern runes
+- **Vite 7.2.4** - Fast build tool and dev server
+- **systeminformation** - Cross-platform system metrics library
+- **nvidia-smi** - Direct GPU querying
+- **Express** - Middleware for SSE handling
+- **Server-Sent Events** - Real-time streaming protocol
+
+## Project Structure
+
+```
+dgx-spark-status/
+├── src/
+│   ├── lib/
+│   │   ├── SystemMetrics.svelte  # Main dashboard component
+│   │   ├── Gauge.svelte          # Circular gauge component
+│   │   └── websocket.js          # SSE client handler
+│   └── routes/
+│       └── api/
+│           ├── metrics/+server.js  # SSE metrics endpoint
+│           └── ollama/+server.js   # Ollama management API
+├── dev-server.js           # Development server with SSE
+├── server.js              # Production server
+├── start.sh              # Startup script with nvm
+└── package.json
+```
+
+## API Endpoints
+
+### GET /api/metrics
+Server-Sent Events stream providing real-time system metrics every second.
+
+### POST /api/ollama
+Ollama model management endpoint.
+
+**Actions:**
+- `pull` - Download a model
+- `delete` - Remove a model
+- `load` - Load model into memory
+- `unload` - Unload model from memory
+
+## License
+
+MIT
+
+## Author
+
+Phanes @ OnticEntia.ai
