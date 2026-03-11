@@ -125,13 +125,14 @@ Ollama model management endpoint.
 
 **Actions:** `pull` | `delete` | `load` | `unload`
 
+## Credits
+
+Originally created by [Phanes](https://github.com/Viroscope) @ [OnticEntia.ai](https://github.com/Viroscope)
+Extended with inference engine integration (llama.cpp, vLLM) and UI improvements by [thx0701](https://github.com/thx0701)
+
 ## License
 
 MIT
-
-## Author
-
-Phanes @ OnticEntia.ai
 
 ---
 
@@ -178,3 +179,8 @@ npm run dev
 - **DGX Spark GB10** - NVIDIA Blackwell 行動版，128GB 統一記憶體，ARM64
 - **作業系統** - Ubuntu 24.04
 - **GPU Driver** - 580.x+
+
+## 致謝
+
+原始專案由 [Phanes](https://github.com/Viroscope) @ [OnticEntia.ai](https://github.com/Viroscope) 建立。
+推論引擎整合（llama.cpp、vLLM）及 UI 改進由 [thx0701](https://github.com/thx0701) 擴充。
