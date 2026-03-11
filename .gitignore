@@ -49,5 +49,9 @@ coverage
 # Vercel
 .vercel
 
+# Backup files
+*.bak-*
+model-notes.json
+
 # Claude Code
 .claude

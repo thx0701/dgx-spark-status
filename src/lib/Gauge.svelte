@@ -103,7 +103,7 @@
   }
 
   .gauge-value {
-    font-size: 1.75rem;
+    font-size: 1.3rem;
     font-weight: 700;
     color: #fff;
     line-height: 1;

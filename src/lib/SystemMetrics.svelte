@@ -6,73 +6,20 @@
   let metrics = $state(null);
   let connected = $state(false);
   let unsubscribe = null;
-  let modelLoading = $state({});
-  let newModelName = $state('');
-  let downloadingModel = $state(false);
-  let showModelManager = $state(false);
-  let consoleOutput = $state([]);
 
-  function addToConsole(message, type = 'info') {
-    consoleOutput = [...consoleOutput, { message, type, timestamp: new Date().toLocaleTimeString() }];
-  }
+  // History for sparklines (last 60 data points = 60 seconds)
+  const HISTORY_LEN = 60;
+  let cpuHistory = $state(Array(HISTORY_LEN).fill(0));
+  let gpuHistory = $state(Array(HISTORY_LEN).fill(0));
+  let netRxHistory = $state(Array(HISTORY_LEN).fill(0));
+  let netTxHistory = $state(Array(HISTORY_LEN).fill(0));
 
-  async function handleModelAction(modelName, action) {
-    modelLoading[modelName] = true;
-
-    try {
-      const response = await fetch('/api/ollama', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, model: modelName })
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        console.error('Model action failed:', result.error);
-      } else if (action === 'delete') {
-        addToConsole(`Deleted model: ${modelName}`, 'success');
-      }
-    } catch (error) {
-      console.error('Model action error:', error);
-      addToConsole(`Error: ${error.message}`, 'error');
-    } finally {
-      modelLoading[modelName] = false;
-    }
-  }
-
-  async function handleDownloadModel() {
-    if (!newModelName.trim()) return;
-
-    downloadingModel = true;
-    const modelName = newModelName.trim();
-    addToConsole(`Starting download: ${modelName}...`, 'info');
-
-    try {
-      const response = await fetch('/api/ollama', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'pull', model: modelName })
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        addToConsole(`Failed to download ${modelName}: ${result.error}`, 'error');
-      } else {
-        addToConsole(`Successfully downloaded: ${modelName}`, 'success');
-        newModelName = '';
-      }
-    } catch (error) {
-      console.error('Download error:', error);
-      addToConsole(`Error: ${error.message}`, 'error');
-    } finally {
-      downloadingModel = false;
-    }
+  function pushHistory(arr, val) {
+    const next = [...arr.slice(1), val];
+    return next;
   }
 
   onMount(() => {
-    // Subscribe to WebSocket updates
     unsubscribe = subscribe((message) => {
       if (message.type === 'connected') {
         connected = true;
@@ -80,20 +27,62 @@
         connected = false;
       } else if (message.type === 'metrics') {
         metrics = message.data;
+        cpuHistory = pushHistory(cpuHistory, message.data.cpu?.usage || 0);
+        gpuHistory = pushHistory(gpuHistory, message.data.gpu?.[0]?.utilizationGpu || 0);
+        const net = message.data.network?.find(n => n.iface === 'all') || message.data.network?.[0];
+        netRxHistory = pushHistory(netRxHistory, net?.rx_sec_mb || 0);
+        netTxHistory = pushHistory(netTxHistory, net?.tx_sec_mb || 0);
       }
     });
-
-    // Get initial state
     metrics = getCurrentMetrics();
     connected = isWebSocketConnected();
   });
 
   onDestroy(() => {
-    if (unsubscribe) {
-      unsubscribe();
-      unsubscribe = null;
-    }
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
   });
+
+  // Notes
+  let editingNote = $state(null);
+  let noteInput = $state('');
+
+  function startEditNote(modelId, currentNote) {
+    editingNote = modelId;
+    noteInput = currentNote || '';
+  }
+
+  async function saveNote(modelId) {
+    await fetch('/api/notes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ modelId, note: noteInput })
+    });
+    editingNote = null;
+  }
+
+  function cancelEdit() { editingNote = null; }
+
+  function getNote(modelId) {
+    return metrics?.modelNotes?.[modelId] || '';
+  }
+
+  // Sparkline path generator
+  function sparklinePath(data, w, h) {
+    if (!data || data.length === 0) return '';
+    const max = Math.max(...data, 1);
+    const step = w / (data.length - 1);
+    return data.map((v, i) => {
+      const x = i * step;
+      const y = h - (v / max) * h;
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+  }
+
+  function sparklineArea(data, w, h) {
+    const path = sparklinePath(data, w, h);
+    if (!path) return '';
+    return path + ` L${w},${h} L0,${h} Z`;
+  }
 
   function formatBytes(bytes) {
     return (bytes / (1024 ** 3)).toFixed(2);
@@ -117,164 +106,287 @@
   </div>
 
   {#if metrics}
-    <div class="dashboard-grid">
-
-      <!-- CPU Card -->
-      <div class="card">
-        <h2>CPU</h2>
-        <div class="gauge-container">
-          <Gauge value={metrics.cpu.usage.toFixed(0)} max={100} color="#76b900" label="%" />
+    <!-- Row 1: CPU, GPU, Memory, Disk — all compact in one row -->
+    <div class="stats-row">
+      <!-- CPU -->
+      <div class="card stat-card">
+        <div class="stat-top">
+          <Gauge value={metrics.cpu.usage.toFixed(0)} max={100} color="#76b900" label="%" size={56} thickness={5} />
+          <div class="stat-info">
+            <h2>CPU</h2>
+            <div class="stat-detail">{metrics.cpu.physicalCores}C/{metrics.cpu.cores}T {metrics.cpu.speed}GHz</div>
+          </div>
         </div>
-        <div class="metric-label">{metrics.cpu.brand}</div>
-        <div class="metric-details">
-          {metrics.cpu.physicalCores} Cores • {metrics.cpu.cores} Threads • {metrics.cpu.speed} GHz
+        <div class="sparkline-container">
+          <svg viewBox="0 0 120 28" preserveAspectRatio="none" class="sparkline">
+            <path d={sparklineArea(cpuHistory, 120, 28)} fill="rgba(118,185,0,0.15)" />
+            <path d={sparklinePath(cpuHistory, 120, 28)} fill="none" stroke="#76b900" stroke-width="1.5" />
+          </svg>
         </div>
       </div>
 
-      <!-- Memory Card -->
-      <div class="card">
-        <h2>Memory</h2>
-        <div class="gauge-container">
-          <Gauge value={metrics.memory.usagePercent.toFixed(0)} max={100} color="#00d4ff" label="%" />
-        </div>
-        <div class="metric-label">{metrics.memory.usedGB} / {metrics.memory.totalGB} GB</div>
-        <div class="metric-details">
-          Free: {metrics.memory.freeGB} GB • Active: {formatBytes(metrics.memory.active)} GB
-        </div>
-      </div>
-
-      <!-- Disk Cards -->
-      {#if metrics.disk && metrics.disk.length > 0}
-        {#each metrics.disk.filter(d => d.mount === '/' || d.mount.startsWith('/home')) as disk}
-          <div class="card">
-            <h2>Disk {disk.mount === '/' ? 'Root' : disk.mount}</h2>
-            <div class="gauge-container">
-              <Gauge value={disk.usagePercent.toFixed(0)} max={100} color="#9c27b0" label="%" />
-            </div>
-            <div class="metric-label">{disk.usedGB} / {disk.sizeGB} GB</div>
-            <div class="metric-details">
-              Free: {disk.availableGB} GB • {disk.type}
-            </div>
-          </div>
-        {/each}
-      {/if}
-
-      <!-- Network Card -->
-      {#if metrics.network && metrics.network.length > 0}
-        {@const primaryNet = metrics.network.find(n => n.iface !== 'lo' && (n.rx_sec > 0 || n.tx_sec > 0)) || metrics.network.find(n => n.iface !== 'lo') || metrics.network[0]}
-        <div class="card">
-          <h2>Network</h2>
-          <div class="network-stats">
-            <div class="network-stat">
-              <div class="network-arrow">↓</div>
-              <div class="network-value">{primaryNet.rx_sec_mb.toFixed(2)}</div>
-              <div class="network-label">MB/s</div>
-            </div>
-            <div class="network-stat">
-              <div class="network-arrow">↑</div>
-              <div class="network-value">{primaryNet.tx_sec_mb.toFixed(2)}</div>
-              <div class="network-label">MB/s</div>
-            </div>
-          </div>
-          <div class="metric-details">
-            {primaryNet.iface}
-          </div>
-        </div>
-      {/if}
-
-      <!-- GPU Cards -->
+      <!-- GPU -->
       {#if metrics.gpu && metrics.gpu.length > 0}
-        {#each metrics.gpu as gpu, index}
-          <div class="card">
-            <h2>GPU {index + 1}</h2>
-            {#if gpu.utilizationGpu !== null}
-              <div class="gauge-container">
-                <Gauge value={gpu.utilizationGpu} max={100} color="#ff9800" label="%" />
+        {@const gpu = metrics.gpu[0]}
+        <div class="card stat-card">
+          <div class="stat-top">
+            <Gauge value={gpu.utilizationGpu ?? 0} max={100} color="#ff9800" label="%" size={56} thickness={5} />
+            <div class="stat-info">
+              <h2>GPU</h2>
+              <div class="stat-detail">
+                {#if gpu.temperatureGpu}{gpu.temperatureGpu}°C{/if}
+                {#if gpu.powerDraw !== null} • {gpu.powerDraw}W{/if}
               </div>
-            {/if}
-            <div class="metric-label">{gpu.model || 'Unknown'}</div>
-            <div class="metric-details">
-              {#if gpu.utilizationGpu !== null}
-                {gpu.utilizationGpu}% Usage
-              {/if}
-              {#if gpu.temperatureGpu}
-                {#if gpu.utilizationGpu !== null} • {/if}{gpu.temperatureGpu}°C
-              {/if}
-              {#if gpu.powerDraw !== null && gpu.powerLimit !== null}
-                {#if gpu.utilizationGpu !== null || gpu.temperatureGpu} • {/if}{gpu.powerDraw}W / {gpu.powerLimit}W
-              {/if}
             </div>
           </div>
-        {/each}
-      {/if}
-
-      <!-- Top Processes -->
-      {#if metrics.processes && metrics.processes.length > 0}
-        <div class="card processes-card">
-          <h2>Top Memory</h2>
-          <div class="processes-compact">
-            {#each metrics.processes.slice(0, 5) as process}
-              <div class="process-compact">
-                <div class="process-info">
-                  <div class="process-name" title="{process.command}">
-                    {process.command.split(' ')[0].split('/').pop()}
-                  </div>
-                  <div class="process-user-compact">{process.user}</div>
-                </div>
-                <div class="process-stats">
-                  <span class="process-mem-compact">{process.memoryGB} GB</span>
-                  <span class="process-cpu-compact">{process.cpu}%</span>
-                </div>
-              </div>
-            {/each}
+          <div class="sparkline-container">
+            <svg viewBox="0 0 120 28" preserveAspectRatio="none" class="sparkline">
+              <path d={sparklineArea(gpuHistory, 120, 28)} fill="rgba(255,152,0,0.15)" />
+              <path d={sparklinePath(gpuHistory, 120, 28)} fill="none" stroke="#ff9800" stroke-width="1.5" />
+            </svg>
           </div>
         </div>
       {/if}
 
-      <!-- Ollama -->
-      {#if metrics.ollama}
-        <div class="card ollama-card">
-          <h2>Ollama</h2>
-          {#if metrics.ollama.available}
-            <div class="ollama-content">
-              <div class="status-badge online">● Online</div>
-              {#if metrics.ollama.models.length > 0}
-                <div class="models-list">
-                  {#each metrics.ollama.models.slice(0, 3) as model}
-                    <div class="model-item" class:loaded={model.running}>
-                      <div class="model-header">
-                        <div class="model-name">{model.name}</div>
-                        <button
-                          class="model-action-btn"
-                          class:loading={modelLoading[model.name]}
-                          onclick={() => handleModelAction(model.name, model.running ? 'unload' : 'load')}
-                          disabled={modelLoading[model.name]}
-                        >
-                          {modelLoading[model.name] ? '...' : model.running ? 'Unload' : 'Load'}
-                        </button>
-                      </div>
-                      <div class="model-info">
-                        <span class="model-size">{model.sizeGB} GB</span>
-                        <span class="model-params">{model.parameters}</span>
+      <!-- Unified Memory -->
+      {#if metrics.processes}
+        {@const totalUsedGB = (metrics.memory.total - metrics.memory.available) / (1024 ** 3)}
+        {@const processRssGB = metrics.processes.reduce((s, p) => s + parseFloat(p.memoryGB), 0)}
+        {@const gpuMemGB = Math.max(0, totalUsedGB - processRssGB)}
+        {@const gpuPct = (gpuMemGB / metrics.memory.totalGB) * 100}
+        {@const osPct = (processRssGB / metrics.memory.totalGB) * 100}
+        <div class="card stat-card">
+          <div class="stat-top">
+            <div class="stat-info" style="width:100%">
+              <h2>Memory</h2>
+              <div class="mem-total-compact">{totalUsedGB.toFixed(1)} / {metrics.memory.totalGB} GB</div>
+            </div>
+          </div>
+          <div class="mem-bar-container">
+            <div class="mem-bar">
+              <div class="mem-bar-gpu" style="width: {gpuPct}%"></div>
+              <div class="mem-bar-os" style="width: {osPct}%"></div>
+            </div>
+          </div>
+          <div class="mem-legend-compact">
+            <span><span class="mem-dot gpu"></span>GPU {gpuMemGB.toFixed(0)}G</span>
+            <span><span class="mem-dot os"></span>OS {processRssGB.toFixed(0)}G</span>
+            <span><span class="mem-dot free"></span>Free {formatBytes(metrics.memory.available)}G</span>
+          </div>
+        </div>
+      {/if}
+
+      <!-- Disk -->
+      {#if metrics.disk}
+        {@const disk = metrics.disk.find(d => d.mount === '/') || metrics.disk[0]}
+        <div class="card stat-card">
+          <div class="stat-top">
+            <div class="stat-info" style="width:100%">
+              <h2>Disk</h2>
+              <div class="mem-total-compact">{disk.usedGB} / {disk.sizeGB} GB</div>
+            </div>
+          </div>
+          <div class="mem-bar-container">
+            <div class="mem-bar">
+              <div class="mem-bar-disk" style="width: {disk.usagePercent}%"></div>
+            </div>
+          </div>
+          <div class="mem-legend-compact">
+            <span><span class="mem-dot disk"></span>Used {disk.usagePercent}%</span>
+            <span><span class="mem-dot free"></span>Free {disk.availableGB} GB</span>
+          </div>
+        </div>
+      {/if}
+
+      <!-- Network -->
+      {#if metrics.network && metrics.network.length > 0}
+        {@const net = metrics.network.find(n => n.iface === 'all') || metrics.network[0]}
+        <div class="card stat-card">
+          <div class="stat-top">
+            <div class="stat-info" style="width:100%">
+              <h2>Network</h2>
+              <div class="net-stats">
+                <span class="net-rx">↓ {net.rx_sec_mb.toFixed(2)} MB/s</span>
+                <span class="net-tx">↑ {net.tx_sec_mb.toFixed(2)} MB/s</span>
+              </div>
+            </div>
+          </div>
+          <div class="sparkline-container">
+            <svg viewBox="0 0 120 28" preserveAspectRatio="none" class="sparkline">
+              <path d={sparklineArea(netRxHistory, 120, 28)} fill="rgba(0,212,255,0.1)" />
+              <path d={sparklinePath(netRxHistory, 120, 28)} fill="none" stroke="#00d4ff" stroke-width="1.5" />
+              <path d={sparklinePath(netTxHistory, 120, 28)} fill="none" stroke="#76b900" stroke-width="1" opacity="0.6" />
+            </svg>
+          </div>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Row 2: Processes (compact) -->
+    {#if metrics.processes && metrics.processes.length > 0}
+      <div class="card processes-row">
+        <h2>Top Processes</h2>
+        <div class="processes-compact">
+          {#each metrics.processes.slice(0, 5) as process}
+            <div class="process-compact">
+              <div class="process-info">
+                <span class="process-name" title="{process.command}">
+                  {process.command.split(' ')[0].split('/').pop()}
+                </span>
+                <span class="process-user-compact">{process.user}</span>
+              </div>
+              <div class="process-stats">
+                <span class="process-mem-compact">{process.memoryGB} GB</span>
+                <span class="process-cpu-compact">{process.cpu}%</span>
+              </div>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    <!-- Row 3: All Models side by side -->
+    {#if metrics.inference}
+      <div class="models-row">
+        <!-- llama.cpp -->
+        <div class="card models-card">
+          <h2>llama.cpp
+            {#if metrics.inference.llama.status === 'running'}
+              <span class="engine-status running">● :{metrics.inference.llama.proxyPort}</span>
+            {:else if metrics.inference.llama.status === 'loading'}
+              <span class="engine-status loading">◐ loading :{metrics.inference.llama.port}</span>
+            {:else}
+              <span class="engine-status stopped">○ stopped</span>
+            {/if}
+          </h2>
+          <div class="models-list">
+            {#if metrics.inference.availableModels?.llama}
+              {#each metrics.inference.availableModels.llama as model}
+                {@const isRunning = metrics.inference.llama.status !== 'stopped' && (metrics.inference.llama.model === model.key || (metrics.inference.llama.model && model.name && metrics.inference.llama.model.includes(model.name.split('-00')[0])))}
+                {@const noteId = `llama:${model.key}`}
+                <div class="model-item {isRunning ? 'loaded' : ''}">
+                  <div class="model-header-row">
+                    <div class="model-name">{model.name || model.key}</div>
+                    {#if isRunning}<span class="running-badge">{metrics.inference.llama.status === 'loading' ? 'LOADING' : 'RUNNING'}</span>{/if}
+                  </div>
+                  <div class="model-info">
+                    {#if model.sizeGB}<span class="model-size">{model.sizeGB} GB</span>{/if}
+                    {#if isRunning && metrics.inference.llama.quantFormat}<span class="model-quant">{metrics.inference.llama.quantFormat}</span>{/if}
+                    {#if isRunning && metrics.inference.llama.paramSize}<span class="model-params">{metrics.inference.llama.paramSize}</span>{/if}
+                    {#if model.ctx}<span class="model-params">ctx: {(model.ctx / 1024).toFixed(0)}K</span>{/if}
+                    {#if isRunning && metrics.inference.llama.ctxSize}<span class="model-params active-ctx">active: {(metrics.inference.llama.ctxSize / 1024).toFixed(0)}K</span>{/if}
+                  </div>
+                  {#if editingNote === noteId}
+                    <div class="note-edit">
+                      <textarea bind:value={noteInput} placeholder="Add note..." rows="2" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveNote(noteId); } if (e.key === 'Escape') cancelEdit(); }}></textarea>
+                      <div class="note-actions">
+                        <button class="note-btn save" onclick={() => saveNote(noteId)}>Save</button>
+                        <button class="note-btn cancel" onclick={cancelEdit}>Cancel</button>
                       </div>
                     </div>
-                  {/each}
+                  {:else}
+                    <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                      {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+                      <span class="note-edit-icon" title="Edit note">✏️</span>
+                    </div>
+                  {/if}
                 </div>
+              {/each}
+            {/if}
+          </div>
+        </div>
+
+        <!-- vLLM -->
+        <div class="card models-card">
+          <h2>vLLM
+            {#if metrics.inference.vllm.status === 'running'}
+              <span class="engine-status running">● running</span>
+            {:else if metrics.inference.vllm.status === 'loading' || metrics.inference.vllm.status === 'starting'}
+              <span class="engine-status loading">◐ {metrics.inference.vllm.status}</span>
+            {:else}
+              <span class="engine-status stopped">○ stopped</span>
+            {/if}
+          </h2>
+          <div class="models-list">
+            {#if metrics.inference.availableModels?.vllm && metrics.inference.availableModels.vllm.length > 0}
+              {#each metrics.inference.availableModels.vllm as model}
+                {@const isRunning = metrics.inference.vllm.status !== 'stopped' && metrics.inference.vllm.model && model.name.includes(metrics.inference.vllm.model)}
+                {@const noteId = `vllm:${model.name}`}
+                <div class="model-item {isRunning ? 'loaded' : ''}">
+                  <div class="model-header-row">
+                    <div class="model-name">{model.name.split('/').pop()}</div>
+                    {#if isRunning}<span class="running-badge">{metrics.inference.vllm.status === 'running' ? 'RUNNING' : 'LOADING'}</span>{/if}
+                  </div>
+                  <div class="model-info">
+                    <span class="model-size">{model.sizeGB} GB</span>
+                    <span class="model-params">{model.name.split('/')[0]}</span>
+                  </div>
+                  {#if editingNote === noteId}
+                    <div class="note-edit">
+                      <textarea bind:value={noteInput} placeholder="Add note..." rows="2" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveNote(noteId); } if (e.key === 'Escape') cancelEdit(); }}></textarea>
+                      <div class="note-actions">
+                        <button class="note-btn save" onclick={() => saveNote(noteId)}>Save</button>
+                        <button class="note-btn cancel" onclick={cancelEdit}>Cancel</button>
+                      </div>
+                    </div>
+                  {:else}
+                    <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                      {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+                      <span class="note-edit-icon" title="Edit note">✏️</span>
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            {:else}
+              <div class="model-info"><span class="model-params">No models downloaded</span></div>
+            {/if}
+          </div>
+        </div>
+
+        <!-- Ollama -->
+        {#if metrics.inference.ollama}
+          <div class="card models-card">
+            <h2>Ollama {#if metrics.inference.ollama.available}<span class="engine-status running">● :{metrics.inference.ollama.port}</span>{:else}<span class="engine-status stopped">○ stopped</span>{/if}</h2>
+            <div class="models-list">
+              {#if metrics.inference.ollama.models && metrics.inference.ollama.models.length > 0}
+                {#each metrics.inference.ollama.models as model}
+                  {@const isRunning = metrics.inference.ollama.runningModel === model.name}
+                  {@const noteId = `ollama:${model.name}`}
+                  <div class="model-item {isRunning ? 'loaded' : ''}">
+                    <div class="model-header-row">
+                      <div class="model-name">{model.name}</div>
+                      {#if isRunning}<span class="running-badge">LOADED</span>{/if}
+                    </div>
+                    <div class="model-info">
+                      {#if model.sizeGB}<span class="model-size">{model.sizeGB} GB</span>{/if}
+                      {#if model.quantFormat}<span class="model-quant">{model.quantFormat}</span>{/if}
+                      {#if model.paramSize}<span class="model-params">{model.paramSize}</span>{/if}
+                      {#if model.family}<span class="model-params">{model.family}</span>{/if}
+                    </div>
+                    {#if editingNote === noteId}
+                      <div class="note-edit">
+                        <textarea bind:value={noteInput} placeholder="Add note..." rows="2" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveNote(noteId); } if (e.key === 'Escape') cancelEdit(); }}></textarea>
+                        <div class="note-actions">
+                          <button class="note-btn save" onclick={() => saveNote(noteId)}>Save</button>
+                          <button class="note-btn cancel" onclick={cancelEdit}>Cancel</button>
+                        </div>
+                      </div>
+                    {:else}
+                      <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                        {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+                        <span class="note-edit-icon" title="Edit note">✏️</span>
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              {:else}
+                <div class="model-info"><span class="model-params">No models</span></div>
               {/if}
             </div>
-            <button class="gear-btn" onclick={() => showModelManager = true} title="Manage Models">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="3"></circle>
-                <path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83"></path>
-              </svg>
-            </button>
-          {:else}
-            <div class="status-badge offline">○ Offline</div>
-          {/if}
-        </div>
-      {/if}
-
-    </div>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     <div class="footer-compact">
       {new Date(metrics.timestamp).toLocaleTimeString()}
@@ -286,92 +398,10 @@
   {/if}
 </div>
 
-<!-- Model Manager Modal -->
-{#if showModelManager}
-  <div class="modal-overlay" onclick={() => showModelManager = false}>
-    <div class="modal" onclick={(e) => e.stopPropagation()}>
-      <div class="modal-header">
-        <h3>Manage Ollama Models</h3>
-        <button class="modal-close" onclick={() => showModelManager = false}>×</button>
-      </div>
-
-      <div class="modal-body">
-        <!-- Download Section -->
-        <div class="modal-section">
-          <h4>Download Model</h4>
-          <div class="model-download">
-            <input
-              type="text"
-              class="model-input"
-              placeholder="model:tag (e.g., llama2:7b)"
-              bind:value={newModelName}
-              disabled={downloadingModel}
-            />
-            <button
-              class="model-action-btn download-btn"
-              onclick={handleDownloadModel}
-              disabled={downloadingModel || !newModelName.trim()}
-            >
-              {downloadingModel ? 'Downloading...' : 'Download'}
-            </button>
-          </div>
-        </div>
-
-        <!-- Models List -->
-        {#if metrics?.ollama?.models.length > 0}
-          <div class="modal-section">
-            <h4>Installed Models</h4>
-            <div class="models-list-modal">
-              {#each metrics.ollama.models as model}
-                <div class="model-item-modal" class:loaded={model.running}>
-                  <div class="model-info-modal">
-                    <div class="model-name">{model.name}</div>
-                    <div class="model-meta">
-                      <span class="model-size">{model.sizeGB} GB</span>
-                      <span class="model-params">{model.parameters}</span>
-                    </div>
-                  </div>
-                  <button
-                    class="model-action-btn delete-btn"
-                    onclick={() => {
-                      if (confirm(`Delete ${model.name}?`)) {
-                        handleModelAction(model.name, 'delete');
-                      }
-                    }}
-                    disabled={modelLoading[model.name] || model.running}
-                    title={model.running ? 'Unload model first' : 'Delete model'}
-                  >
-                    Delete
-                  </button>
-                </div>
-              {/each}
-            </div>
-          </div>
-        {/if}
-
-        <!-- Console Output -->
-        {#if consoleOutput.length > 0}
-          <div class="modal-section">
-            <h4>Activity Log</h4>
-            <div class="console">
-              {#each consoleOutput as log}
-                <div class="console-line {log.type}">
-                  <span class="console-time">[{log.timestamp}]</span>
-                  <span class="console-message">{log.message}</span>
-                </div>
-              {/each}
-            </div>
-          </div>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
-
 <style>
   .dashboard {
     min-height: 100vh;
-    padding: 1rem;
+    padding: 0.5rem;
     max-width: 1600px;
     margin: 0 auto;
   }
@@ -380,8 +410,8 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 1rem;
-    padding: 0.5rem 0;
+    margin-bottom: 0.5rem;
+    padding: 0.25rem 0;
   }
 
   .header-left {
@@ -390,103 +420,142 @@
     gap: 1rem;
   }
 
-  h1 {
-    margin: 0;
-    color: #76b900;
-    font-size: 1.75rem;
-    font-weight: 600;
-  }
-
-  .system-name {
-    color: #666;
-    font-size: 0.85rem;
-  }
-
-  .uptime {
-    color: #888;
-    font-size: 0.75rem;
-    margin-top: 0.25rem;
-  }
+  h1 { margin: 0; color: #76b900; font-size: 1.3rem; font-weight: 600; }
+  .system-name { color: #666; font-size: 0.85rem; }
+  .uptime { color: #888; font-size: 0.75rem; }
 
   h2 {
-    margin: 0 0 0.75rem 0;
+    margin: 0 0 0.3rem 0;
     color: #76b900;
-    font-size: 0.85rem;
+    font-size: 0.7rem;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    text-align: center;
-    width: 100%;
-  }
-
-  .dashboard-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: 0.75rem;
   }
 
   .status {
-    padding: 0.4rem 0.9rem;
+    padding: 0.3rem 0.7rem;
     border-radius: 4px;
     font-weight: 600;
-    font-size: 0.85rem;
+    font-size: 0.8rem;
   }
-
-  .status.connected {
-    background: #1a4d1a;
-    color: #76b900;
-  }
-
-  .status.disconnected {
-    background: #4d1a1a;
-    color: #ff6b6b;
-  }
+  .status.connected { background: #1a4d1a; color: #76b900; }
+  .status.disconnected { background: #4d1a1a; color: #ff6b6b; }
 
   .card {
     background: #1a1a1a;
     border: 1px solid #2a2a2a;
     border-radius: 8px;
-    padding: 1rem;
+    padding: 0.5rem;
     transition: border-color 0.2s;
+  }
+  .card:hover { border-color: #76b900; }
+
+  /* Row 1: Stats row — horizontal scroll on mobile */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .stat-card {
     display: flex;
     flex-direction: column;
-    justify-content: space-between;
-    align-items: center;
-    text-align: center;
-    min-height: 250px;
+    gap: 0.3rem;
+    min-height: 0;
   }
 
-  .card:hover {
-    border-color: #76b900;
-  }
-
-  .gauge-container {
+  .stat-top {
     display: flex;
-    justify-content: center;
-    margin: 0.5rem 0;
+    align-items: center;
+    gap: 0.5rem;
   }
 
-  .metric-label {
-    color: #aaa;
-    font-size: 0.9rem;
-    margin: 0.5rem 0;
-    text-align: center;
+  .stat-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .stat-info h2 { margin: 0; text-align: left; }
+
+  .stat-detail {
+    color: #888;
+    font-size: 0.65rem;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
-  .metric-details {
-    color: #666;
-    font-size: 0.75rem;
-    margin-top: 0.75rem;
-    text-align: center;
+  .sparkline-container {
+    width: 100%;
+    height: 28px;
   }
 
-  .processes-compact {
+  .sparkline {
+    width: 100%;
+    height: 100%;
+  }
+
+  /* Memory compact */
+  .mem-total-compact {
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: #fff;
+  }
+
+  .mem-bar-container { width: 100%; }
+
+  .mem-bar {
+    width: 100%;
+    height: 10px;
+    background: #2a2a2a;
+    border-radius: 5px;
+    overflow: hidden;
     display: flex;
-    flex-direction: column;
+  }
+  .mem-bar-gpu { height: 100%; background: #ff9800; transition: width 0.5s; }
+  .mem-bar-os { height: 100%; background: #00d4ff; transition: width 0.5s; }
+  .mem-bar-disk { height: 100%; background: #9c27b0; transition: width 0.5s; }
+
+  .mem-legend-compact {
+    display: flex;
     gap: 0.5rem;
+    font-size: 0.6rem;
+    color: #888;
+    flex-wrap: wrap;
+  }
+
+  .mem-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    display: inline-block; vertical-align: middle; margin-right: 2px;
+  }
+  .mem-dot.gpu { background: #ff9800; }
+  .mem-dot.os { background: #00d4ff; }
+  .mem-dot.disk { background: #9c27b0; }
+  .mem-dot.free { background: #2a2a2a; border: 1px solid #555; }
+
+  /* Network */
+  .net-stats {
+    display: flex;
+    gap: 0.75rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .net-rx { color: #00d4ff; }
+  .net-tx { color: #76b900; }
+
+  /* Processes row */
+  .processes-row {
+    margin-bottom: 0.5rem;
+  }
+
+  .processes-row h2 { text-align: left; }
+
+  .processes-compact {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 0.3rem;
     width: 100%;
   }
 
@@ -494,10 +563,10 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 0.5rem;
+    padding: 0.25rem 0.4rem;
     background: #0f0f0f;
     border-radius: 4px;
-    font-size: 0.8rem;
+    font-size: 0.65rem;
   }
 
   .process-info {
@@ -514,81 +583,65 @@
     font-family: 'Monaco', 'Menlo', monospace;
   }
 
-  .process-user-compact {
-    color: #00d4ff;
-    font-size: 0.7rem;
-  }
+  .process-user-compact { color: #00d4ff; font-size: 0.6rem; }
 
   .process-stats {
     display: flex;
-    gap: 0.75rem;
+    gap: 0.4rem;
     flex-shrink: 0;
+    font-size: 0.65rem;
+  }
+  .process-mem-compact { color: #76b900; font-weight: 600; }
+  .process-cpu-compact { color: #ff9800; }
+
+  /* Models row */
+  .models-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
   }
 
-  .process-mem-compact {
-    color: #76b900;
-    font-weight: 600;
-  }
-
-  .process-cpu-compact {
-    color: #ff9800;
-  }
-
-  .footer-compact {
-    text-align: center;
-    color: #444;
-    font-size: 0.7rem;
-    margin-top: 0.5rem;
-    padding: 0.5rem 0;
-  }
-
-  .loading-state {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 50vh;
-  }
-
-  .loading {
-    color: #888;
-    font-size: 1.2rem;
-  }
-
-  .ollama-content {
+  .models-card {
+    min-height: 0;
+    max-height: 450px;
+    text-align: left;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
-    gap: 1rem;
-    align-items: center;
-    width: 100%;
+  }
+
+  .models-card .models-list {
+    overflow-y: auto;
     flex: 1;
   }
 
-  .status-badge {
-    padding: 0.4rem 0.8rem;
-    border-radius: 4px;
+  .models-card h2 {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    text-align: left;
+  }
+
+  .engine-status {
+    font-size: 0.65rem;
     font-weight: 600;
-    font-size: 0.85rem;
+    text-transform: none;
+    letter-spacing: 0;
   }
-
-  .status-badge.online {
-    background: #1a4d1a;
-    color: #76b900;
-  }
-
-  .status-badge.offline {
-    background: #4d1a1a;
-    color: #ff6b6b;
-  }
+  .engine-status.running { color: #76b900; }
+  .engine-status.loading { color: #ffd166; }
+  .engine-status.stopped { color: #ff6b6b; }
 
   .models-list {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 0.4rem;
     width: 100%;
   }
 
   .model-item {
-    padding: 0.75rem;
+    padding: 0.35rem 0.4rem;
     background: #0f0f0f;
     border-radius: 4px;
     border: 1px solid #2a2a2a;
@@ -598,316 +651,115 @@
   .model-item.loaded {
     background: rgba(118, 185, 0, 0.1);
     border: 1px solid #76b900;
-    box-shadow: 0 0 10px rgba(118, 185, 0, 0.2);
+    box-shadow: 0 0 8px rgba(118, 185, 0, 0.2);
   }
 
-  .ollama-card {
-    position: relative;
-  }
-
-  .gear-btn {
-    position: absolute;
-    bottom: 0.75rem;
-    right: 0.75rem;
-    background: transparent;
-    border: none;
-    color: #888;
-    cursor: pointer;
-    padding: 0.25rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: color 0.2s;
-  }
-
-  .gear-btn:hover {
-    color: #76b900;
-  }
-
-  .modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: rgba(0, 0, 0, 0.8);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-  }
-
-  .modal {
-    background: #1a1a1a;
-    border: 1px solid #76b900;
-    border-radius: 8px;
-    width: 90%;
-    max-width: 600px;
-    max-height: 80vh;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .modal-header {
+  .model-header-row {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 1rem;
-    border-bottom: 1px solid #2a2a2a;
-  }
-
-  .modal-header h3 {
-    margin: 0;
-    color: #76b900;
-    font-size: 1.2rem;
-  }
-
-  .modal-close {
-    background: transparent;
-    border: none;
-    color: #888;
-    font-size: 2rem;
-    cursor: pointer;
-    padding: 0;
-    line-height: 1;
-    transition: color 0.2s;
-  }
-
-  .modal-close:hover {
-    color: #ff6b6b;
-  }
-
-  .modal-body {
-    padding: 1rem;
-    overflow-y: auto;
-  }
-
-  .modal-section {
-    margin-bottom: 1.5rem;
-  }
-
-  .modal-section h4 {
-    margin: 0 0 0.75rem 0;
-    color: #aaa;
-    font-size: 0.9rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .model-download {
-    display: flex;
-    gap: 0.5rem;
-    width: 100%;
-  }
-
-  .model-input {
-    flex: 1;
-    padding: 0.5rem;
-    background: #2a2a2a;
-    border: 1px solid #3a3a3a;
-    border-radius: 4px;
-    color: #fff;
-    font-size: 0.85rem;
-    font-family: 'Monaco', 'Menlo', monospace;
-  }
-
-  .model-input:focus {
-    outline: none;
-    border-color: #76b900;
-  }
-
-  .model-input::placeholder {
-    color: #666;
-  }
-
-  .model-input:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .models-list-modal {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  .model-item-modal {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 0.75rem;
-    background: #0f0f0f;
-    border-radius: 4px;
-    border: 1px solid #2a2a2a;
-    transition: all 0.2s;
-  }
-
-  .model-item-modal.loaded {
-    background: rgba(118, 185, 0, 0.1);
-    border: 1px solid #76b900;
-  }
-
-  .model-info-modal {
-    flex: 1;
-  }
-
-  .model-meta {
-    display: flex;
-    gap: 0.75rem;
-    margin-top: 0.25rem;
-  }
-
-  .console {
-    background: #0a0a0a;
-    border: 1px solid #2a2a2a;
-    border-radius: 4px;
-    padding: 0.75rem;
-    max-height: 200px;
-    overflow-y: auto;
-    font-family: 'Monaco', 'Menlo', monospace;
-    font-size: 0.8rem;
-  }
-
-  .console-line {
-    margin-bottom: 0.5rem;
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  .console-time {
-    color: #666;
-    flex-shrink: 0;
-  }
-
-  .console-message {
-    color: #aaa;
-  }
-
-  .console-line.success .console-message {
-    color: #76b900;
-  }
-
-  .console-line.error .console-message {
-    color: #ff6b6b;
-  }
-
-  .console-line.info .console-message {
-    color: #00d4ff;
-  }
-
-  .model-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 0.5rem;
   }
 
   .model-name {
     color: #fff;
     font-weight: 600;
-    font-size: 0.9rem;
+    font-size: 0.8rem;
     font-family: 'Monaco', 'Menlo', monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
-  .model-action-btn {
-    padding: 0.25rem 0.75rem;
-    background: #2a2a2a;
-    border: 1px solid #3a3a3a;
-    border-radius: 4px;
+  .running-badge {
+    font-size: 0.55rem;
+    font-weight: 700;
     color: #76b900;
-    font-size: 0.75rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s;
-  }
-
-  .model-action-btn:hover:not(:disabled) {
-    background: #3a3a3a;
-    border-color: #76b900;
-  }
-
-  .model-action-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .delete-btn {
-    color: #ff6b6b !important;
-    background: #2a1a1a !important;
-    border-color: #4d1a1a !important;
-  }
-
-  .delete-btn:hover:not(:disabled) {
-    background: #4d1a1a !important;
-    border-color: #ff6b6b !important;
-  }
-
-  .delete-btn:disabled {
-    opacity: 0.3;
-  }
-
-  .download-btn {
     background: #1a4d1a;
-    border-color: #2a5a2a;
-  }
-
-  .download-btn:hover:not(:disabled) {
-    background: #2a5a2a;
-    border-color: #76b900;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
   }
 
   .model-info {
     display: flex;
-    gap: 0.75rem;
-    font-size: 0.75rem;
+    gap: 0.5rem;
+    font-size: 0.7rem;
+    flex-wrap: wrap;
   }
 
-  .model-size {
-    color: #76b900;
+  .model-size { color: #76b900; font-weight: 600; }
+
+  .model-quant {
+    color: #e6a817;
     font-weight: 600;
+    background: rgba(230, 168, 23, 0.15);
+    padding: 0px 4px;
+    border-radius: 3px;
+    font-size: 0.7em;
   }
 
-  .model-params {
-    color: #888;
-  }
+  .model-params { color: #888; }
+  .model-params.active-ctx { color: #76b900; font-weight: 600; }
 
-  .network-stats {
+  /* Notes */
+  .note-display {
     display: flex;
-    gap: 2rem;
+    align-items: center;
+    gap: 0.3rem;
+    margin-top: 0.2rem;
+    cursor: pointer;
+    min-height: 1.2rem;
+  }
+  .note-display:hover .note-edit-icon { opacity: 1; }
+  .note-text { color: #aaa; font-size: 0.7em; line-height: 1.3; white-space: pre-wrap; }
+  .note-edit-icon { opacity: 0.2; font-size: 0.65em; transition: opacity 0.2s; flex-shrink: 0; }
+
+  .note-edit { margin-top: 0.2rem; }
+  .note-edit textarea {
+    width: 100%;
+    background: #1a1a2e;
+    border: 1px solid #444;
+    color: #ddd;
+    border-radius: 4px;
+    padding: 0.3rem;
+    font-size: 0.75em;
+    font-family: inherit;
+    resize: vertical;
+  }
+  .note-edit textarea:focus { outline: none; border-color: #76b900; }
+
+  .note-actions { display: flex; gap: 0.3rem; margin-top: 0.2rem; }
+  .note-btn { padding: 2px 8px; border: none; border-radius: 3px; cursor: pointer; font-size: 0.7em; }
+  .note-btn.save { background: #76b900; color: #000; }
+  .note-btn.cancel { background: #444; color: #ccc; }
+
+  .footer-compact {
+    text-align: center;
+    color: #444;
+    font-size: 0.65rem;
+    margin-top: 0.3rem;
+    padding: 0.3rem 0;
+  }
+
+  .loading-state {
+    display: flex;
+    align-items: center;
     justify-content: center;
-    align-items: center;
-    flex: 1;
+    min-height: 50vh;
   }
+  .loading { color: #888; font-size: 1.2rem; }
 
-  .network-stat {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.25rem;
-  }
-
-  .network-arrow {
-    font-size: 1.5rem;
-    color: #76b900;
-  }
-
-  .network-value {
-    font-size: 1.75rem;
-    font-weight: 700;
-    color: #fff;
-    line-height: 1;
-  }
-
-  .network-label {
-    color: #888;
-    font-size: 0.75rem;
+  /* Responsive */
+  @media (max-width: 1200px) {
+    .stats-row { grid-template-columns: repeat(3, 1fr); }
+    .models-row { grid-template-columns: repeat(2, 1fr); }
+    .processes-compact { grid-template-columns: repeat(3, 1fr); }
   }
 
   @media (max-width: 768px) {
-    .dashboard-grid {
-      grid-template-columns: 1fr;
-    }
+    .stats-row { grid-template-columns: repeat(2, 1fr); }
+    .models-row { grid-template-columns: 1fr; }
+    .processes-compact { grid-template-columns: 1fr; }
   }
 </style>

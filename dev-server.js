@@ -3,48 +3,358 @@ import si from 'systeminformation';
 import express from 'express';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 
 const execAsync = promisify(exec);
 const UPDATE_INTERVAL = 1000;
-const OLLAMA_API = 'http://localhost:11434';
+const LLAMA_SERVER = 'http://127.0.0.1:8001';
 
-// Get Ollama models and status
-async function getOllamaInfo() {
+// Model notes — user-editable, stored in JSON file
+const NOTES_FILE = '/opt/dgx-spark-status/model-notes.json';
+
+function loadNotes() {
   try {
-    const [tagsResponse, psResponse] = await Promise.all([
-      fetch(`${OLLAMA_API}/api/tags`),
-      fetch(`${OLLAMA_API}/api/ps`)
+    if (existsSync(NOTES_FILE)) return JSON.parse(readFileSync(NOTES_FILE, 'utf8'));
+  } catch (e) {}
+  return {};
+}
+
+function saveNotes(notes) {
+  writeFileSync(NOTES_FILE, JSON.stringify(notes, null, 2), 'utf8');
+}
+
+function parseModelMeta(modelId) {
+  if (!modelId) return { model: null, quantFormat: null, paramSize: null };
+  const quantMatch = modelId.match(/(Q\d+_K(?:_[A-Z]+)?|Q\d+_\d+|F16|F32|BF16|FP8|MXFP4)/i);
+  const model = modelId
+    .replace(/-\d+-of-\d+\.gguf.*$/, '')
+    .replace(/\.gguf.*$/, '')
+    .replace(/^.*\//, '');
+  const paramMatch = model.match(/(\d+B)/i);
+  return {
+    model,
+    quantFormat: quantMatch ? quantMatch[1] : null,
+    paramSize: paramMatch ? paramMatch[1] : null
+  };
+}
+
+async function getAvailableModels() {
+  const models = { llama: [], vllm: [] };
+
+  // Scan switch-model.sh for llama.cpp model definitions
+  try {
+    const { stdout } = await execAsync("grep -E '^MODELS\\[' /usr/local/bin/switch-model.sh 2>/dev/null");
+    const ctxOut = (await execAsync("grep -E '^CTX\\[' /usr/local/bin/switch-model.sh 2>/dev/null").catch(() => ({ stdout: '' }))).stdout;
+    const ctxMap = {};
+    for (const line of ctxOut.trim().split('\n')) {
+      const m = line.match(/^CTX\[(\w+)\]="?(\d+)"?/);
+      if (m) ctxMap[m[1]] = parseInt(m[2]);
+    }
+    for (const line of stdout.trim().split('\n')) {
+      const m = line.match(/^MODELS\[(\w+)\]="([^"]+)"/);
+      if (m) {
+        const key = m[1];
+        const path = m[2];
+        const filename = path.split('/').pop().replace(/\.gguf.*/, '').replace(/-\d+-of-\d+$/, '').replace(/^stepfun-ai_/, '');
+        let sizeGB = null;
+        try {
+          // For multi-file models use directory, for single file use the file itself
+          const target = path.includes('-00001-of-') ? path.substring(0, path.lastIndexOf('/')) : path;
+          const { stdout: sizeOut } = await execAsync(`du -sb "${target}" 2>/dev/null | cut -f1`);
+          const bytes = parseInt(sizeOut.trim());
+          if (bytes > 1e9) sizeGB = parseFloat((bytes / (1024 ** 3)).toFixed(1));
+        } catch (e) {}
+        models.llama.push({ key, name: filename, path, sizeGB, ctx: ctxMap[key] || null });
+      }
+    }
+  } catch (e) {}
+
+  // Scan HuggingFace cache for vLLM models
+  try {
+    const { stdout } = await execAsync("ls -d /root/.cache/huggingface/hub/models--*/ 2>/dev/null");
+    for (const dir of stdout.trim().split('\n').filter(Boolean)) {
+      const dirClean = dir.replace(/\/+$/, '');
+      const basename = dirClean.split('/').pop();
+      const name = basename.replace(/^models--/, '').replace(/--/g, '/');
+      let sizeGB = null;
+      try {
+        const { stdout: sizeOut } = await execAsync(`du -sb "${dir}" 2>/dev/null | cut -f1`);
+        const bytes = parseInt(sizeOut.trim());
+        if (bytes < 1e9) continue;
+        sizeGB = parseFloat((bytes / (1024 ** 3)).toFixed(1));
+      } catch (e) { continue; }
+      models.vllm.push({ name, sizeGB, path: dir });
+    }
+  } catch (e) {}
+
+  // Scan /opt/models/ for locally downloaded vLLM models
+  try {
+    const { stdout } = await execAsync("ls -d /opt/models/*/ 2>/dev/null");
+    for (const dir of stdout.trim().split('\n').filter(Boolean)) {
+      const dirClean = dir.replace(/\/+$/, '');
+      const name = dirClean.split('/').pop();
+      let sizeGB = null;
+      try {
+        const { stdout: sizeOut } = await execAsync(`du -sb "${dirClean}" 2>/dev/null | cut -f1`);
+        const bytes = parseInt(sizeOut.trim());
+        if (bytes < 1e9) continue;
+        sizeGB = parseFloat((bytes / (1024 ** 3)).toFixed(1));
+      } catch (e) { continue; }
+      models.vllm.push({ name, sizeGB, path: dirClean });
+    }
+  } catch (e) {}
+
+  return models;
+}
+
+// Get llama.cpp server info
+async function getLlamaInfo() {
+  try {
+    const [healthRes, propsRes, slotsRes] = await Promise.allSettled([
+      fetch(`${LLAMA_SERVER}/health`, { signal: AbortSignal.timeout(2000) }),
+      fetch(`${LLAMA_SERVER}/props`, { signal: AbortSignal.timeout(2000) }),
+      fetch(`${LLAMA_SERVER}/slots`, { signal: AbortSignal.timeout(2000) })
     ]);
 
-    if (!tagsResponse.ok) throw new Error('Ollama not available');
+    let healthy = false;
+    let loading = false;
+    let processRunning = false;
+    let model = 'unknown';
+    let ctxSize = null;
+    let quantFormat = null;
+    let paramSize = null;
 
-    const data = await tagsResponse.json();
-    const psData = psResponse.ok ? await psResponse.json() : { models: [] };
+    if (healthRes.status === 'fulfilled') {
+      healthy = healthRes.value.ok;
+      if (!healthy) {
+        try {
+          const err = await healthRes.value.json();
+          const msg = err?.error?.message || '';
+          if (/loading model/i.test(msg)) loading = true;
+        } catch (e) {}
+      }
+    }
 
-    // Get running model names from /api/ps
-    const runningModelNames = psData.models.map(m => m.name);
+    // Try /slots first (newer llama-server), fallback to /props
+    if (slotsRes.status === 'fulfilled' && slotsRes.value.ok) {
+      const slots = await slotsRes.value.json();
+      if (Array.isArray(slots) && slots.length > 0) {
+        ctxSize = slots[0]?.n_ctx || null;
+      }
+    }
+    if (!ctxSize && propsRes.status === 'fulfilled') {
+      if (propsRes.value.ok) {
+        const props = await propsRes.value.json();
+        ctxSize = props?.default_generation_settings?.params?.n_ctx || null;
+      } else {
+        try {
+          const err = await propsRes.value.json();
+          const msg = err?.error?.message || '';
+          if (/loading model/i.test(msg)) loading = true;
+        } catch (e) {}
+      }
+    }
+
+    // Get model name from /v1/models API (includes full filename with quant format)
+    try {
+      const modelsRes = await fetch(`${LLAMA_SERVER}/v1/models`, { signal: AbortSignal.timeout(2000) });
+      if (modelsRes.ok) {
+        const modelsData = await modelsRes.json();
+        const modelId = modelsData?.data?.[0]?.id || '';
+        if (modelId) {
+          const parsed = parseModelMeta(modelId);
+          model = parsed.model || model;
+          quantFormat = parsed.quantFormat || quantFormat;
+          paramSize = parsed.paramSize || paramSize;
+        }
+      } else {
+        try {
+          const err = await modelsRes.json();
+          const msg = err?.error?.message || '';
+          if (/loading model/i.test(msg)) loading = true;
+        } catch (e) {}
+      }
+    } catch (e) {}
+
+    // Fallback to running process if API isn't ready yet.
+    try {
+      const { stdout: psOut } = await execAsync("ps -eo args | grep -E '[/]llama-server ' | grep -v grep | head -n 1");
+      const cmd = (psOut || '').trim();
+      if (cmd) {
+        processRunning = true;
+        const modelMatch = cmd.match(/--model\s+(\S+)/);
+        if (modelMatch) {
+          const path = modelMatch[1];
+          if (model === 'unknown') {
+            const base = path.split('/').pop() || path;
+            model = base.replace(/-\d+-of-\d+\.gguf.*$/, '').replace(/\.gguf.*$/, '');
+          }
+          if (!quantFormat || !paramSize) {
+            const parsed = parseModelMeta(path);
+            quantFormat = parsed.quantFormat || quantFormat;
+            paramSize = parsed.paramSize || paramSize;
+          }
+        }
+        if (!ctxSize) {
+          const ctxMatch = cmd.match(/--ctx-size\s+(\d+)/);
+          if (ctxMatch) ctxSize = parseInt(ctxMatch[1], 10);
+        }
+      }
+    } catch (e) {}
+
+    // Fallback to systemctl/ps if API didn't work
+    if (model === 'unknown') {
+      try {
+        const { stdout } = await execAsync("systemctl show llama-server -p Description --value 2>/dev/null");
+        const match = stdout.match(/\(([^)]+)\)/);
+        if (match) model = match[1];
+      } catch (e) {}
+    }
+
+    const status = healthy ? 'running' : (loading || processRunning ? 'loading' : 'stopped');
 
     return {
-      available: true,
-      models: data.models.map(m => ({
-        name: m.name,
-        size: m.size,
-        sizeGB: (m.size / (1024 ** 3)).toFixed(2),
-        modified: m.modified_at,
-        digest: m.digest.substring(0, 12),
-        family: m.details?.family || 'unknown',
-        parameters: m.details?.parameter_size || 'unknown',
-        running: runningModelNames.includes(m.name)
-      })),
-      runningCount: runningModelNames.length
+      engine: 'llama.cpp',
+      available: status !== 'stopped',
+      status,
+      model,
+      ctxSize,
+      quantFormat,
+      paramSize,
+      port: 8001,
+      proxyPort: 8000
     };
   } catch (error) {
+    return { engine: 'llama.cpp', available: false, status: 'stopped', model: null, ctxSize: null, port: 8001, proxyPort: 8000 };
+  }
+}
+
+// Get vLLM container info
+async function getVllmInfo() {
+  try {
+    const { stdout } = await execAsync("docker ps --filter 'name=vllm' --format '{{.Names}}|{{.Status}}|{{.Ports}}' 2>/dev/null");
+    const running = stdout.trim();
+    let containers = [];
+    if (running) {
+      containers = running.split('\n').map(line => {
+        const [name, status, ports] = line.split('|');
+        return { name, status, ports };
+      });
+    }
+
+    let model = null;
+    let modelAlias = null;
+    let modelFromPath = null;
+    let loading = false;
+    const modelEndpoints = [
+      'http://127.0.0.1:8100/v1/models',
+      'http://127.0.0.1:8102/v1/models',
+      'http://127.0.0.1:8109/v1/models'
+    ];
+    for (const endpoint of modelEndpoints) {
+      try {
+        const { stdout: modelsOut } = await execAsync(`curl -s --max-time 2 ${endpoint} 2>/dev/null || true`);
+        if (!modelsOut) continue;
+        if (/Loading model/i.test(modelsOut)) {
+          loading = true;
+          continue;
+        }
+        const data = JSON.parse(modelsOut);
+        modelAlias = data?.data?.[0]?.id || modelAlias;
+        if (modelAlias) break;
+      } catch (e) {
+        if (/Loading model/i.test(String(e?.message || ''))) loading = true;
+      }
+    }
+
+    // Parse served alias + actual model path from docker command line.
+    if (containers.length > 0) {
+      try {
+        const names = containers.map(c => c.name).join(' ');
+        const { stdout: inspectOut } = await execAsync(
+          `docker inspect ${names} --format '{{.Name}}|{{json .Config.Cmd}}' 2>/dev/null || true`
+        );
+        for (const line of (inspectOut || '').trim().split('\n').filter(Boolean)) {
+          const parts = line.split('|');
+          if (parts.length < 2) continue;
+          const cmd = JSON.parse(parts[1]);
+          const servedIdx = cmd.indexOf('--served-model-name');
+          if (servedIdx >= 0 && cmd[servedIdx + 1]) {
+            modelAlias = modelAlias || cmd[servedIdx + 1];
+          }
+          const serveIdx = cmd.indexOf('serve');
+          if (serveIdx >= 0 && cmd[serveIdx + 1]) {
+            const rawPath = cmd[serveIdx + 1];
+            modelFromPath = rawPath.split('/').filter(Boolean).pop() || rawPath;
+          }
+          if (modelAlias || modelFromPath) {
+            break;
+          }
+        }
+      } catch (e) {}
+    }
+
+    // Prefer real model name for dashboard matching; keep alias for reference.
+    model = modelFromPath || modelAlias || model;
+
+    const status = containers.length === 0 ? 'stopped' : (model ? 'running' : (loading ? 'loading' : 'starting'));
+
     return {
-      available: false,
-      models: [],
-      runningCount: 0,
-      error: error.message
+      engine: 'vLLM',
+      available: containers.length > 0,
+      status,
+      model,
+      modelAlias,
+      containers
     };
+  } catch (error) {
+    return { engine: 'vLLM', available: false, status: 'stopped', model: null, containers: [] };
+  }
+}
+
+// Get Ollama info
+async function getOllamaInfo() {
+  try {
+    const res = await fetch('http://127.0.0.1:11434/api/tags', { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return { engine: 'Ollama', available: false, status: 'stopped', models: [], port: 11434 };
+    const data = await res.json();
+    const models = (data.models || []).map(m => {
+      const sizeGB = m.size ? parseFloat((m.size / (1024 ** 3)).toFixed(1)) : null;
+      // Parse quant from model details or name
+      const quantFormat = m.details?.quantization_level || null;
+      const paramSize = m.details?.parameter_size || null;
+      return {
+        name: m.name,
+        sizeGB,
+        quantFormat,
+        paramSize,
+        family: m.details?.family || null,
+        modified: m.modified_at
+      };
+    });
+
+    // Check if any model is currently loaded (running)
+    let runningModel = null;
+    try {
+      const psRes = await fetch('http://127.0.0.1:11434/api/ps', { signal: AbortSignal.timeout(2000) });
+      if (psRes.ok) {
+        const psData = await psRes.json();
+        if (psData.models && psData.models.length > 0) {
+          runningModel = psData.models[0].name;
+        }
+      }
+    } catch (e) {}
+
+    return {
+      engine: 'Ollama',
+      available: true,
+      status: 'running',
+      models,
+      runningModel,
+      port: 11434
+    };
+  } catch (error) {
+    return { engine: 'Ollama', available: false, status: 'stopped', models: [], port: 11434 };
   }
 }
 
@@ -129,18 +439,27 @@ async function getNvidiaGPUInfo() {
 // Collect system metrics
 async function getSystemMetrics() {
   try {
-    const [cpu, mem, currentLoad, osInfo, gpuData, processes, ollama, fsSize, time, networkStats] = await Promise.all([
+    const [cpu, mem, currentLoad, osInfo, gpuData, processes, llamaInfo, vllmInfo, ollamaInfo, availableModels, fsSize, time, networkStats] = await Promise.all([
       si.cpu(),
       si.mem(),
       si.currentLoad(),
       si.osInfo(),
       getNvidiaGPUInfo(),
       getTopProcesses(10),
+      getLlamaInfo(),
+      getVllmInfo(),
       getOllamaInfo(),
+      getAvailableModels(),
       si.fsSize(),
       si.time(),
       si.networkStats()
     ]);
+
+    const physical = networkStats.filter(n => n.iface !== 'lo' && !n.iface.startsWith('veth') && !n.iface.startsWith('br-'));
+    const totalRx = physical.reduce((sum, n) => sum + (n.rx_sec || 0), 0);
+    const totalTx = physical.reduce((sum, n) => sum + (n.tx_sec || 0), 0);
+    const totalRxBytes = physical.reduce((sum, n) => sum + (n.rx_bytes || 0), 0);
+    const totalTxBytes = physical.reduce((sum, n) => sum + (n.tx_bytes || 0), 0);
 
     const metrics = {
       timestamp: Date.now(),
@@ -174,7 +493,12 @@ async function getSystemMetrics() {
       },
       gpu: gpuData,
       processes: processes,
-      ollama: ollama,
+      inference: {
+        llama: llamaInfo,
+        vllm: vllmInfo,
+        ollama: ollamaInfo,
+        availableModels
+      },
       disk: fsSize.map(disk => ({
         fs: disk.fs,
         type: disk.type,
@@ -193,7 +517,15 @@ async function getSystemMetrics() {
         hours: Math.floor((time.uptime % 86400) / 3600),
         minutes: Math.floor((time.uptime % 3600) / 60)
       },
-      network: networkStats.map(net => ({
+      network: [{
+        iface: 'all',
+        rx_sec: totalRx,
+        tx_sec: totalTx,
+        rx_bytes: totalRxBytes,
+        tx_bytes: totalTxBytes,
+        rx_sec_mb: parseFloat((totalRx / (1024 ** 2)).toFixed(2)),
+        tx_sec_mb: parseFloat((totalTx / (1024 ** 2)).toFixed(2))
+      }, ...physical.map(net => ({
         iface: net.iface,
         rx_sec: net.rx_sec,
         tx_sec: net.tx_sec,
@@ -201,7 +533,7 @@ async function getSystemMetrics() {
         tx_bytes: net.tx_bytes,
         rx_sec_mb: parseFloat((net.rx_sec / (1024 ** 2)).toFixed(2)),
         tx_sec_mb: parseFloat((net.tx_sec / (1024 ** 2)).toFixed(2))
-      }))
+      }))]
     };
 
     return metrics;
@@ -262,6 +594,7 @@ async function broadcastMetrics() {
   try {
     const metrics = await getSystemMetrics();
     if (!metrics) return;
+    metrics.modelNotes = loadNotes();
 
     const data = `data: ${JSON.stringify(metrics)}\n\n`;
 
@@ -298,6 +631,24 @@ async function startDevServer() {
 
   // Add SSE endpoint BEFORE Vite middleware
   app.get('/api/metrics', handleSSE);
+
+  // Model notes API
+  app.use(express.json());
+  app.get('/api/notes', (req, res) => {
+    res.json(loadNotes());
+  });
+  app.post('/api/notes', (req, res) => {
+    const { modelId, note } = req.body;
+    if (!modelId) return res.status(400).json({ error: 'modelId required' });
+    const notes = loadNotes();
+    if (note && note.trim()) {
+      notes[modelId] = note.trim();
+    } else {
+      delete notes[modelId];
+    }
+    saveNotes(notes);
+    res.json({ ok: true, notes });
+  });
 
   // Use Vite middleware
   app.use(vite.middlewares);
